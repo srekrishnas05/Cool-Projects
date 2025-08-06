@@ -28,6 +28,7 @@ An interactive visualization of the Knight’s Tour problem in chess — built w
 - `g++`, `SFML` installed via:
   bash:
   ```
+  cd /c/Users/(whatever your user's name is)/Downloads/knightstour
   pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-sfml
   ./knight-tour
     ```
