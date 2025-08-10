@@ -1,0 +1,301 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Web Tuner (MPM + Device Picker)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 820px; margin: 24px auto; }
+    label { display:block; margin-top: 12px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    select, button { padding: 6px 10px; }
+    .readout { margin-top: 16px; font-size: 1.05rem; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <h1>Web Tuner</h1>
+
+  <div class="row">
+    <label>Input device
+      <select id="deviceSelect"></select>
+    </label>
+
+    <label>Tuning
+      <select id="tuning">
+        <option value="standard6">Standard 6 (E2 A2 D3 G3 B3 E4)</option>
+        <option value="dropB7">Drop B 7 (B1 F#2 B2 E3 A3 C#4 F#4)</option>
+      </select>
+    </label>
+
+    <label>String
+      <select id="string"></select>
+    </label>
+  </div>
+
+  <div class="row" style="margin-top:8px">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+
+  <div class="readout">
+    <div>Target: <span id="targetNote" class="mono">—</span> (<span id="targetHz" class="mono">—</span> Hz)</div>
+    <div>Detected: <span id="detNote" class="mono">—</span> (<span id="detHz" class="mono">—</span> Hz)</div>
+    <div>Offset: <span id="detCents" class="mono">—</span> cents</div>
+    <div>Status: <strong id="status">—</strong></div>
+  </div>
+
+<script type="module">
+import { NOTE_FREQS } from './noteFrequencies.js';
+
+/* ------------ Note helpers using your data ------------ */
+const NOTE_LIST = Array.from(NOTE_FREQS.entries())
+  .map(([name, f]) => ({ name, f }))
+  .sort((a,b)=>a.f-b.f);
+
+function freqOf(name){ const f = NOTE_FREQS.get(name); return (f && isFinite(f))? f : NaN; }
+function centsDiff(f, ft){ return 1200 * Math.log2(f/ft); }
+function nearestNoteFromFreq(f){
+  if(!isFinite(f) || f<=0) return null;
+  let lo=0, hi=NOTE_LIST.length-1;
+  while(lo < hi){ const mid=(lo+hi)>>1; (NOTE_LIST[mid].f < f)? lo=mid+1 : hi=mid; }
+  const cands=[]; if(lo<NOTE_LIST.length) cands.push(NOTE_LIST[lo]); if(lo>0) cands.push(NOTE_LIST[lo-1]);
+  cands.sort((a,b)=>Math.abs(a.f-f)-Math.abs(b.f-f));
+  return cands[0]||null;
+}
+
+/* ------------ Tunings ------------ */
+const TUNINGS = {
+  standard6: ["E2","A2","D3","G3","B3","E4"],
+  dropB7:    ["B1","F#2","B2","E3","A3","C#4","F#4"],
+};
+
+/* ------------ UI ------------ */
+const els = {
+  deviceSelect: document.getElementById('deviceSelect'),
+  tuningSel: document.getElementById('tuning'),
+  stringSel: document.getElementById('string'),
+  targetNote: document.getElementById('targetNote'),
+  targetHz:   document.getElementById('targetHz'),
+  detNote:    document.getElementById('detNote'),
+  detHz:      document.getElementById('detHz'),
+  detCents:   document.getElementById('detCents'),
+  status:     document.getElementById('status'),
+  startBtn:   document.getElementById('startBtn'),
+  stopBtn:    document.getElementById('stopBtn'),
+};
+
+function refreshStringList(){
+  const t = els.tuningSel.value;
+  els.stringSel.innerHTML = '';
+  for(const n of TUNINGS[t]){
+    const opt = document.createElement('option');
+    opt.value = n; opt.textContent = n;
+    els.stringSel.appendChild(opt);
+  }
+}
+els.tuningSel.addEventListener('change', ()=>{ refreshStringList(); updateTargetUI(); });
+function updateTargetUI(){
+  const n = els.stringSel.value, f = freqOf(n);
+  els.targetNote.textContent = n || '—';
+  els.targetHz.textContent = isFinite(f) ? f.toFixed(2) : '—';
+}
+refreshStringList(); updateTargetUI();
+els.stringSel.addEventListener('change', updateTargetUI);
+
+/* ------------ Device list ------------ */
+async function populateDevices(){
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const inputs = devices.filter(d => d.kind === 'audioinput');
+  els.deviceSelect.innerHTML = '';
+  for(const d of inputs){
+    const opt = document.createElement('option');
+    opt.value = d.deviceId;
+    opt.textContent = d.label || `Input ${els.deviceSelect.length+1}`;
+    els.deviceSelect.appendChild(opt);
+  }
+}
+if (navigator.mediaDevices?.getUserMedia) {
+  // Prompt once so labels show up
+  await navigator.mediaDevices.getUserMedia({audio:true});
+  await populateDevices();
+}
+
+/* ------------ Audio + MPM Pitch Detection ------------ */
+let audioCtx, mediaStream, src, analyser, rafId, workBuf;
+let sampleRate = 44100;
+let emaFreq = null;
+const EMA_ALPHA = 0.35;
+
+// pick frame size based on selected target (lower note => bigger frame)
+function chooseFrameSize() {
+  const fT = freqOf(els.stringSel.value);
+  if (!isFinite(fT)) return 4096;
+  if (fT < 90)  return 8192;       // low B/E
+  if (fT < 180) return 4096;       // D–A–G range
+  return 4096;                     // high strings still okay
+}
+
+// Hann window + DC removal
+function prepFrame(buf){
+  let mean=0; for(let i=0;i<buf.length;i++) mean += buf[i];
+  mean /= buf.length;
+  const N = buf.length;
+  for(let i=0;i<N;i++){
+    const w = 0.5*(1-Math.cos(2*Math.PI*i/(N-1)));
+    buf[i] = (buf[i]-mean) * w;
+  }
+}
+
+// McLeod Pitch Method (MPM) core
+function mpmPitch(frame, sr) {
+  const N = frame.length;
+  const maxTau = Math.floor(sr/40);   // 40 Hz floor
+  const minTau = Math.floor(sr/1500); // 1.5 kHz ceiling
+  const nsdf = new Float32Array(maxTau+1);
+
+  // normalized square difference function
+  let acf0 = 0;
+  for(let i=0;i<N;i++) acf0 += frame[i]*frame[i]; // energy
+  if (acf0 < 1e-8) return null;
+
+  for(let tau=minTau; tau<=maxTau; tau++){
+    let acf=0, norm=0;
+    for(let i=0;i<N-tau;i++){
+      const a = frame[i], b = frame[i+tau];
+      acf += a*b;
+      norm += a*a + b*b;
+    }
+    nsdf[tau] = (2*acf) / (norm + 1e-12);
+  }
+
+  // find highest peak after first negative crossing
+  let bestTau=-1, bestVal=-1;
+  // skip tiny taus that often carry harmonic junk
+  for(let tau=minTau; tau<=maxTau-1; tau++){
+    if (nsdf[tau] > nsdf[tau-1] && nsdf[tau] >= nsdf[tau+1] && nsdf[tau] > bestVal) {
+      bestVal = nsdf[tau];
+      bestTau = tau;
+    }
+  }
+  if(bestTau < 0 || bestVal < 0.3) return null; // 0.3 threshold keeps it stable
+
+  // parabolic refine around bestTau
+  const y0 = nsdf[bestTau-1] ?? nsdf[bestTau];
+  const y1 = nsdf[bestTau];
+  const y2 = nsdf[bestTau+1] ?? nsdf[bestTau];
+  const denom = (y0 - 2*y1 + y2);
+  const shift = denom !== 0 ? 0.5*(y0 - y2)/denom : 0;
+  const tau = bestTau + shift;
+
+  const f = sr / tau;
+  return (f>=40 && f<=1500) ? f : null;
+}
+
+// light octave bias around target
+function octaveBias(f, fTarget){
+  if(!f || !isFinite(fTarget)) return f;
+  while(f < fTarget/1.8) f *= 2;
+  while(f > fTarget*1.8) f /= 2;
+  return f;
+}
+function smoothEMA(f){
+  if(!f) return null;
+  if(emaFreq == null){ emaFreq = f; return f; }
+  emaFreq = EMA_ALPHA*f + (1-EMA_ALPHA)*emaFreq;
+  return emaFreq;
+}
+
+async function start(){
+  els.startBtn.disabled = true;
+  els.stopBtn.disabled = false;
+
+  const deviceId = els.deviceSelect.value || undefined;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+  sampleRate = audioCtx.sampleRate;
+
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      deviceId: deviceId ? { exact: deviceId } : undefined,
+      echoCancellation:false, noiseSuppression:false, autoGainControl:false
+    }
+  });
+  src = audioCtx.createMediaStreamSource(mediaStream);
+
+  analyser = audioCtx.createAnalyser();
+  analyser.smoothingTimeConstant = 0;
+  analyser.fftSize = chooseFrameSize();               // we’ll reuse its internal ring buffer
+  analyser.minDecibels = -120;                        // widen dynamic range
+  analyser.maxDecibels =  -5;
+
+  src.connect(analyser);
+
+  workBuf = new Float32Array(analyser.fftSize);
+  emaFreq = null;
+
+  const loop = () => {
+    // adjust frame size if string changed
+    const needed = chooseFrameSize();
+    if (analyser.fftSize !== needed) {
+      analyser.fftSize = needed;
+      workBuf = new Float32Array(analyser.fftSize);
+    }
+
+    // pull a frame and compute RMS for visibility
+    analyser.getFloatTimeDomainData(workBuf);
+    let rms=0; for(let i=0;i<workBuf.length;i++){ const v=workBuf[i]; rms += v*v; }
+    rms = Math.sqrt(rms/workBuf.length);
+    els.status.textContent = `Signal: ${(rms*1000).toFixed(1)}`;
+
+    // prepare and detect
+    const frame = workBuf.slice();   // copy so we can window
+    prepFrame(frame);
+    let f = mpmPitch(frame, sampleRate);
+
+    // bias toward selected string (prevents E4→E3 collapses)
+    const fTarget = freqOf(els.stringSel.value);
+    f = octaveBias(f, fTarget);
+
+    // smooth
+    f = smoothEMA(f);
+
+    // UI
+    if(f && isFinite(f)){
+      const near = nearestNoteFromFreq(f);
+      els.detNote.textContent = near ? near.name : '—';
+      els.detHz.textContent = f.toFixed(2);
+
+      if (isFinite(fTarget)) {
+        const cents = centsDiff(f, fTarget);
+        els.detCents.textContent = (cents>=0?'+':'') + cents.toFixed(1);
+        const tol = 5;
+        let status = 'In tune';
+        if(cents < -tol) status = 'Tune up';
+        else if(cents > tol) status = 'Tune down';
+        els.status.textContent = `${status} | Signal: ${(rms*1000).toFixed(1)}`;
+      } else {
+        els.detCents.textContent = '—';
+      }
+    } else {
+      els.detNote.textContent = '—';
+      els.detHz.textContent = '—';
+      els.detCents.textContent = '—';
+    }
+
+    rafId = requestAnimationFrame(loop);
+  };
+  loop();
+}
+
+function stop(){
+  els.startBtn.disabled = false;
+  els.stopBtn.disabled = true;
+  if(rafId) cancelAnimationFrame(rafId);
+  if(mediaStream) mediaStream.getTracks().forEach(t=>t.stop());
+  if(audioCtx) audioCtx.close();
+}
+
+document.getElementById('startBtn').addEventListener('click', start);
+document.getElementById('stopBtn').addEventListener('click', stop);
+</script>
+</body>
+</html>
